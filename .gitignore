@@ -1,0 +1,32 @@
+# Python caches
+__pycache__/
+*.py[cod]
+
+# Data / datasets
+dataset/
+data/
+*.csv
+
+# Experiment outputs
+exp/
+exp_reports/
+exp_runs/
+outputs/
+runs/
+training_losses.csv
+metrics.json
+train.log
+*.pt
+*.pth
+*.ckpt
+
+# LaTeX / docs artifacts
+*.aux
+*.log
+*.out
+*.toc
+*.synctex.gz
+*.pdf
+
+# OS files
+.DS_Store

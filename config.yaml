@@ -1,0 +1,44 @@
+# Default training configuration for Creative-GNN
+
+# Data
+node_csv: "dataset/[0-9]*.csv"
+edge_csv: "dataset/edges_knn_k4.csv"
+
+in_fields: "Density__kg_m3_,Eddy_Viscosity__Pa_s_,Pressure__Pa_,Static_Enthalpy__J_kg1_,Temperature__K_"
+out_fields: "Pressure__Pa_,Velocity_u__m_s1_,Velocity_v__m_s1_,Velocity_w__m_s1_,Density__kg_m3_"
+
+# Training
+epochs: 100
+pretrain_epochs: 10
+batch_size: 2
+num_workers: 0
+lr: 0.01
+hidden_dim: 32
+num_regions: 2
+ode_steps: 1
+ode_method: "rk4"
+ode_t: 1.0
+ode_rtol: null
+ode_atol: null
+device: "cpu"
+lambda_flux: 1.0
+lambda_vort: 0.1
+lambda_smooth: 0.1
+lr_schedule: "cosine"
+early_stop_patience: 10
+loss_csv: "outputs/training_losses.csv"
+vel_indices: "1,2,3"
+geom_type: "rbf"
+geom_dim: 16
+geom_gamma: null
+flux_dim: 5
+flux_nproj: 1
+local_beta: 1.0
+local_depth: 2
+disable_flux: false
+input_noise_std: 0.0
+eval_noise_std: 0.0
+normalize: false
+norm_eps: 1e-6
+ckpt: null
+
