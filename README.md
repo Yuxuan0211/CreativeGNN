@@ -53,13 +53,13 @@ For fixed train/val/test splits, see `baseline.yaml` and run:
 python starttraining.py -c baseline.yaml
 ```
 
-### 如果已有 CGNS 网格，重排 CSV 的节点编号
-有时 Fluent 导出会重排节点顺序。用网格文件对齐节点编号：
+### If you already have a CGNS mesh, reindex the node IDs in your CSV. 
+Fluent exports can reorder nodes, so align the CSV with the mesh file:
 ```bash
 python reorder_by_cgns.py --cgns mesh.cgns --node-csv "dataset/Ma=2 t=0.csv" --out-csv "dataset/Ma=2 t=0_reordered.csv" \
   --edge-csv "dataset/edges.csv" --out-edge-csv "dataset/edges_reordered.csv" --tol 1e-6
 ```
-脚本会用 CGNS 的节点顺序重排节点 CSV，若提供边文件则一并重映射索引。确保坐标匹配（`tol` 为匹配容差）。
+The script reorders the node CSV to match the CGNS node order; if an edge file is provided, it remaps indices as well. Make sure coordinates match (tol is the matching tolerance).
 
 ## Notes
 - The reference integration uses `torchdiffeq` (`odeint`) with RK4 by default; swap to an adaptive solver for stiff regimes.
