@@ -9,20 +9,12 @@ from .mlp import build_mlp
 class RegionLocalSolver(nn.Module):
     """Lightweight region-adaptive operator to capture dominant local physics."""
 
-    def __init__(
-        self,
-        hidden_dim: int,
-        num_regions: int = 4,
-        dropout: float = 0.0,
-        beta: float = 1.0,
-        depth: int = 2,
-    ):
+    def __init__(self, hidden_dim: int, num_regions: int = 4, dropout: float = 0.0):
         super().__init__()
         self.num_regions = num_regions
-        self.beta = beta
         self.ops = nn.ModuleList(
             [
-                build_mlp(hidden_dim * 2, hidden_dim, hidden_dim, num_layers=depth, dropout=dropout)
+                build_mlp(hidden_dim * 2, hidden_dim, hidden_dim, num_layers=2, dropout=dropout)
                 for _ in range(num_regions)
             ]
         )
@@ -55,7 +47,5 @@ class RegionLocalSolver(nn.Module):
             weight = region_mask[:, ridx].unsqueeze(-1)
             out = op(torch.cat([h, agg], dim=-1))
             outputs.append(out * weight)
-        weights = region_mask.sum(dim=1, keepdim=True).clamp_min(1e-6)
-        h_star = torch.stack(outputs, dim=0).sum(dim=0) / weights
-        h_next = h + self.beta * (h_star - h)
-        return self.norm(h_next)
+        correction = torch.stack(outputs, dim=0).sum(dim=0)
+        return self.norm(h + correction)

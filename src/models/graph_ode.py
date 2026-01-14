@@ -11,9 +11,7 @@ class GraphNeuralODEFunc(nn.Module):
 
     def __init__(self, hidden_dim: int, message_dim: int, edge_feat_dim: int = 0, dropout: float = 0.0):
         super().__init__()
-        in_dim = 2 * hidden_dim + 3 + edge_feat_dim
-        self.msg_mlp = build_mlp(in_dim, message_dim, message_dim, num_layers=2, dropout=dropout)
-        self.att_mlp = build_mlp(in_dim, message_dim, 1, num_layers=2, dropout=dropout)
+        self.msg_mlp = build_mlp(2 * hidden_dim + 3 + edge_feat_dim, message_dim, message_dim, num_layers=2, dropout=dropout)
         self.update_mlp = build_mlp(hidden_dim + message_dim, hidden_dim, hidden_dim, num_layers=2, dropout=dropout)
         self.norm = nn.LayerNorm(hidden_dim)
         self.edge_attr: Optional[torch.Tensor] = None
@@ -34,13 +32,10 @@ class GraphNeuralODEFunc(nn.Module):
         pieces = [h[src], h[dst], rel_pos]
         if self.edge_attr is not None:
             pieces.append(self.edge_attr)
-        msg_input = torch.cat(pieces, dim=-1)
-        msg = self.msg_mlp(msg_input)
-        att = torch.sigmoid(self.att_mlp(msg_input)).squeeze(-1)
-        msg = msg * att.unsqueeze(-1)
+        msg = self.msg_mlp(torch.cat(pieces, dim=-1))
 
         agg = torch.zeros_like(h)
         agg.index_add_(0, dst, msg)
 
         dh = self.update_mlp(torch.cat([h, agg], dim=-1))
-        return self.norm(dh)
+        return self.norm(h + dh)
