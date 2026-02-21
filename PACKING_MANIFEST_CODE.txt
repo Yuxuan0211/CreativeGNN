@@ -1,0 +1,8 @@
+Neural-network code package for GitHub
+Source: h:\article_jcp_bundle_packages_20260220_213009\data_full_snapshot_article_jcp_bundle\external\CreativeGNN
+Created: 20260221_123859
+Total files: 45
+Python files: 36
+Included top-level: *.py, *.yaml/yml, README.md, requirements.txt, .gitignore
+Included dirs: src/, scripts/
+Excluded: runs/, exp/, splits/, dataset_splits_fine100/, __pycache__/, .git/

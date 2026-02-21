@@ -6,15 +6,23 @@ import torch.nn.functional as F
 def supervised_loss(pred: torch.Tensor, target: torch.Tensor, volume: Optional[torch.Tensor] = None) -> torch.Tensor:
     if volume is None:
         return F.mse_loss(pred, target)
-    w = volume.unsqueeze(-1)
-    return (w * (pred - target) ** 2).mean()
+    # Weighted mean over nodes. Using .mean() here would divide by N twice when
+    # volume is already normalized (e.g., volume_i = 1/N), making losses
+    # artificially tiny and misleading.
+    w = volume.unsqueeze(-1).clamp_min(0.0)
+    err2 = (pred - target) ** 2
+    return (w * err2).sum() / (w.sum() * err2.size(1) + 1e-12)
 
 
 def flux_loss(residual: torch.Tensor, volume: Optional[torch.Tensor] = None) -> torch.Tensor:
-    per_node = residual.pow(2).sum(dim=-1)
+    if residual.dim() == 1:
+        per_node = residual.pow(2)
+    else:
+        per_node = residual.pow(2).sum(dim=-1)
     if volume is None:
         return per_node.mean()
-    return (volume * per_node).mean()
+    w = volume.clamp_min(0.0)
+    return (w * per_node).sum() / (w.sum() + 1e-12)
 
 
 def smoothness_loss(latent: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
@@ -58,7 +66,8 @@ def compute_losses(
 ) -> Dict[str, torch.Tensor]:
     losses: Dict[str, torch.Tensor] = {}
     losses["supervised"] = supervised_loss(pred, target, volume)
-    losses["flux"] = flux_loss(aux["flux_residual_pre_norm"], volume)
+    flux_key = "flux_residual_post_norm" if "flux_residual_post_norm" in aux else "flux_residual_pre_norm"
+    losses["flux"] = flux_loss(aux[flux_key], volume)
     vort_pred = pred_denorm if pred_denorm is not None else pred
     losses["vorticity"] = vorticity_loss(vort_pred, pos, edge_index, vel_indices=vel_indices)
     losses["smooth"] = smoothness_loss(aux["latent"], edge_index)

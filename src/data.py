@@ -1,6 +1,8 @@
 import math
 import random
+import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import List, Optional, Sequence, Tuple, Union
 
 import numpy as np
@@ -193,6 +195,7 @@ class CFDDataset(Dataset):
         edge_csvs: Union[str, List[str]],
         in_fields: Optional[List[str]] = None,
         out_fields: Optional[List[str]] = None,
+        auto_region_mask: bool = True,
     ):
         super().__init__()
         if isinstance(node_csvs, str):
@@ -221,8 +224,11 @@ class CFDDataset(Dataset):
         self.edge_paths = list(edge_csvs)
         self.in_fields = in_fields if in_fields is not None else default_in
         self.out_fields = out_fields if out_fields is not None else default_out
+        self.auto_region_mask = auto_region_mask
         self.graphs: List[GraphSample] = []
-        for n_path, e_path in zip(node_csvs, edge_csvs):
+        total_graphs = len(node_csvs)
+        t_load0 = time.perf_counter()
+        for idx, (n_path, e_path) in enumerate(zip(node_csvs, edge_csvs), start=1):
             node_table = np.genfromtxt(n_path, delimiter=",", names=True, dtype=np.float32, encoding="utf-8")
             names = node_table.dtype.names
 
@@ -256,16 +262,23 @@ class CFDDataset(Dataset):
             edge_index = torch.unique(edge_index, dim=1)
 
             volume = torch.full((num_nodes,), 1.0 / num_nodes, dtype=torch.float32)
+            region_mask = self._build_region_mask(node_table) if self.auto_region_mask else None
             self.graphs.append(
                 GraphSample(
                     x=torch.from_numpy(x),
                     pos=torch.from_numpy(pos),
                     edge_index=edge_index,
                     y=torch.from_numpy(y),
-                    region_mask=None,
+                    region_mask=region_mask,
                     volume=volume,
                 )
             )
+            if total_graphs >= 10 and (idx == 1 or idx % 5 == 0 or idx == total_graphs):
+                dt = time.perf_counter() - t_load0
+                print(
+                    f"[CFDDataset] loaded {idx}/{total_graphs} graphs "
+                    f"(latest={Path(n_path).name}, elapsed={dt:.1f}s)"
+                )
 
         self.in_dim = self.graphs[0].x.shape[1]
         self.out_dim = self.graphs[0].y.shape[1]
@@ -275,3 +288,49 @@ class CFDDataset(Dataset):
 
     def __getitem__(self, idx: int) -> GraphSample:
         return self.graphs[idx]
+
+    @staticmethod
+    def _safe_norm(values: np.ndarray) -> np.ndarray:
+        values = np.abs(values.astype(np.float32))
+        q = float(np.percentile(values, 95.0))
+        if not np.isfinite(q) or q < 1e-6:
+            q = float(values.mean() + 1e-6)
+        return np.clip(values / (q + 1e-8), 0.0, 1.0)
+
+    def _build_region_mask(self, node_table: np.ndarray) -> Optional[torch.Tensor]:
+        names = set(node_table.dtype.names or [])
+        if "X__m_" not in names:
+            return None
+
+        x = node_table["X__m_"].astype(np.float32)
+        n = x.shape[0]
+        ones = np.ones(n, dtype=np.float32)
+
+        # Shock-like indicator: high vorticity magnitude or pressure deviation.
+        if "VelocityCurl_Z__s1_" in names:
+            shock = self._safe_norm(node_table["VelocityCurl_Z__s1_"])
+        elif "Pressure__Pa_" in names:
+            p = node_table["Pressure__Pa_"].astype(np.float32)
+            shock = self._safe_norm(p - float(np.median(p)))
+        else:
+            shock = np.zeros(n, dtype=np.float32)
+
+        # Boundary-layer proxy: high turbulent viscosity.
+        if "Eddy_Viscosity__Pa_s_" in names:
+            boundary = self._safe_norm(node_table["Eddy_Viscosity__Pa_s_"])
+        else:
+            boundary = np.zeros(n, dtype=np.float32)
+
+        # Wake proxy: downstream nodes with transverse motion.
+        if "Velocity_v__m_s1_" in names:
+            v_abs = np.abs(node_table["Velocity_v__m_s1_"].astype(np.float32))
+        else:
+            v_abs = np.zeros(n, dtype=np.float32)
+        x_tail = np.maximum(x - float(np.percentile(x, 60.0)), 0.0)
+        wake = self._safe_norm(x_tail * v_abs)
+
+        free = np.clip(ones - np.maximum.reduce([shock, boundary, wake]), 0.0, 1.0)
+
+        weights = np.stack([shock, boundary, wake, free], axis=1) + 1e-6
+        weights = weights / weights.sum(axis=1, keepdims=True)
+        return torch.from_numpy(weights.astype(np.float32))

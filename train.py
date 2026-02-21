@@ -47,11 +47,21 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--lambda-flux", type=float, default=1.0)
     parser.add_argument("--lambda-vort", type=float, default=0.1)
     parser.add_argument("--lambda-smooth", type=float, default=0.1)
+    parser.add_argument("--lambda-pressure-focus", type=float, default=0.0, help="Weight for pressure-focused loss near LE/TE/shock.")
+    parser.add_argument("--focus-pressure-index", type=int, default=0, help="Pressure channel index inside out_fields.")
+    parser.add_argument("--focus-near-y", type=float, default=0.08, help="Near-airfoil |y| threshold for focused loss.")
+    parser.add_argument("--focus-le-x", type=float, default=0.15, help="Leading-edge x upper bound for focused loss.")
+    parser.add_argument("--focus-te-x", type=float, default=0.80, help="Trailing-edge x lower bound for focused loss.")
+    parser.add_argument("--focus-le-gain", type=float, default=2.0, help="Extra weight added in leading-edge region.")
+    parser.add_argument("--focus-te-gain", type=float, default=1.0, help="Extra weight added in trailing-edge region.")
+    parser.add_argument("--focus-shock-gain", type=float, default=2.0, help="Extra weight added in high pressure-gradient region.")
+    parser.add_argument("--focus-shock-quantile", type=float, default=0.92, help="Quantile for pressure-gradient shock mask.")
+    parser.add_argument("--focus-enable-pretrain", action="store_true", help="Apply pressure-focused loss during pretraining stage too.")
     parser.add_argument("--geom-type", type=str, default="rbf", choices=["rbf", "poly"])
     parser.add_argument("--geom-dim", type=int, default=16)
     parser.add_argument("--geom-gamma", type=float, default=None)
     parser.add_argument("--flux-dim", type=int, default=5)
-    parser.add_argument("--flux-nproj", type=int, default=1)
+    parser.add_argument("--flux-nproj", type=int, default=3)
     parser.add_argument("--local-beta", type=float, default=1.0)
     parser.add_argument("--local-depth", type=int, default=2)
     parser.add_argument("--pretrain-epochs", type=int, default=0)
@@ -68,14 +78,23 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--deterministic", action="store_true", help="Enable deterministic CUDA behavior.")
     parser.add_argument("--output-dir", type=str, default=None, help="Optional output directory for logs/metrics.")
     parser.add_argument("--ckpt", type=str, default=None, help="Optional path to save a checkpoint.")
+    parser.add_argument("--init-ckpt", type=str, default=None, help="Optional checkpoint path to initialize model weights.")
     parser.add_argument("--node-csv", type=str, default=None, help="Path to node feature CSV (e.g., Ma=2 t=0.1.csv).")
     parser.add_argument("--edge-csv", type=str, default=None, help="Path to edge triplet CSV (e.g., Desktop1_edges_triplet.csv).")
     parser.add_argument("--train-node-csv", type=str, default=None, help="Comma-separated or globbed train node CSVs.")
     parser.add_argument("--val-node-csv", type=str, default=None, help="Comma-separated or globbed val node CSVs.")
     parser.add_argument("--test-node-csv", type=str, default=None, help="Comma-separated or globbed test node CSVs.")
+    parser.add_argument("--train-node-list-file", type=str, default=None, help="Text file with one train node CSV path per line.")
+    parser.add_argument("--val-node-list-file", type=str, default=None, help="Text file with one val node CSV path per line.")
+    parser.add_argument("--test-node-list-file", type=str, default=None, help="Text file with one test node CSV path per line.")
     parser.add_argument("--train-edge-csv", type=str, default=None, help="Train edge CSVs (defaults to --edge-csv).")
     parser.add_argument("--val-edge-csv", type=str, default=None, help="Val edge CSVs (defaults to --edge-csv).")
     parser.add_argument("--test-edge-csv", type=str, default=None, help="Test edge CSVs (defaults to --edge-csv).")
+    parser.add_argument("--train-edge-list-file", type=str, default=None, help="Text file with one train edge CSV path per line.")
+    parser.add_argument("--val-edge-list-file", type=str, default=None, help="Text file with one val edge CSV path per line.")
+    parser.add_argument("--test-edge-list-file", type=str, default=None, help="Text file with one test edge CSV path per line.")
+    parser.add_argument("--norm-stats-in", type=str, default=None, help="Optional .npz path to load normalization stats from.")
+    parser.add_argument("--norm-stats-out", type=str, default=None, help="Optional .npz path to save computed normalization stats.")
     parser.add_argument(
         "--in-fields",
         type=str,
@@ -92,8 +111,13 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def _expand_paths(raw: str) -> List[str]:
-    parts = [p.strip() for p in raw.split(",") if p.strip()]
+def _expand_paths(raw) -> List[str]:
+    if raw is None:
+        return []
+    if isinstance(raw, (list, tuple)):
+        parts = [str(p).strip() for p in raw if str(p).strip()]
+    else:
+        parts = [p.strip() for p in str(raw).split(",") if p.strip()]
     out: List[str] = []
     for p in parts:
         matches = glob.glob(p)
@@ -116,7 +140,7 @@ def _parse_indices(raw: Optional[str]) -> Optional[Tuple[int, int, int]]:
 def _ensure_loss_csv(path: Optional[str]) -> Optional[List[str]]:
     if path is None:
         return None
-    fieldnames = ["epoch", "stage", "split", "lr", "supervised", "flux", "vorticity", "smooth", "total"]
+    fieldnames = ["epoch", "stage", "split", "lr", "supervised", "flux", "vorticity", "smooth", "focus", "total"]
     csv_path = Path(path)
     if not csv_path.exists() or csv_path.stat().st_size == 0:
         csv_path.parent.mkdir(parents=True, exist_ok=True)
@@ -143,7 +167,7 @@ def _set_seed(seed: int, deterministic: bool) -> None:
         torch.backends.cudnn.benchmark = False
 
 
-def _resolve_edge_paths(edge_csv: Optional[str], fallback: Optional[str], label: str) -> str:
+def _resolve_edge_paths(edge_csv, fallback, label: str):
     if edge_csv is not None:
         return edge_csv
     if fallback is not None:
@@ -152,8 +176,8 @@ def _resolve_edge_paths(edge_csv: Optional[str], fallback: Optional[str], label:
 
 
 def _make_dataset(
-    node_csvs: str,
-    edge_csvs: str,
+    node_csvs,
+    edge_csvs,
     in_fields: Optional[List[str]],
     out_fields: Optional[List[str]],
 ) -> CFDDataset:
@@ -162,6 +186,43 @@ def _make_dataset(
     if len(edge_paths) == 1 and len(node_paths) > 1:
         edge_paths = edge_paths * len(node_paths)
     return CFDDataset(node_paths, edge_paths, in_fields=in_fields, out_fields=out_fields)
+
+
+def _load_list_file(list_file: Optional[str]) -> Optional[List[str]]:
+    if list_file is None:
+        return None
+    lines = [ln.strip() for ln in Path(list_file).read_text(encoding="utf-8").splitlines() if ln.strip()]
+    if not lines:
+        raise ValueError(f"List file is empty: {list_file}")
+    return lines
+
+
+def _resolve_path_spec(csv_arg, list_file: Optional[str]):
+    if list_file is not None:
+        return _load_list_file(list_file)
+    return csv_arg
+
+
+def _load_norm_stats(path: str) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    arr = np.load(path)
+    return (
+        torch.tensor(arr["mean_x"], dtype=torch.float32),
+        torch.tensor(arr["std_x"], dtype=torch.float32),
+        torch.tensor(arr["mean_y"], dtype=torch.float32),
+        torch.tensor(arr["std_y"], dtype=torch.float32),
+    )
+
+
+def _save_norm_stats(path: str, mean_x: torch.Tensor, std_x: torch.Tensor, mean_y: torch.Tensor, std_y: torch.Tensor) -> None:
+    out = Path(path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        out,
+        mean_x=mean_x.detach().cpu().numpy(),
+        std_x=std_x.detach().cpu().numpy(),
+        mean_y=mean_y.detach().cpu().numpy(),
+        std_y=std_y.detach().cpu().numpy(),
+    )
 
 
 def _save_config(output_dir: Optional[str], args: argparse.Namespace) -> Optional[Path]:
@@ -212,6 +273,70 @@ def _compute_stats(dataset) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, t
     std_x = torch.sqrt(torch.clamp(var_x, min=0.0))
     std_y = torch.sqrt(torch.clamp(var_y, min=0.0))
     return mean_x, std_x, mean_y, std_y
+
+
+def _pressure_focus_loss(
+    pred_phys: torch.Tensor,
+    target_phys: torch.Tensor,
+    pos: torch.Tensor,
+    edge_index: torch.Tensor,
+    pressure_index: int,
+    near_y: float,
+    le_x: float,
+    te_x: float,
+    le_gain: float,
+    te_gain: float,
+    shock_gain: float,
+    shock_quantile: float,
+) -> torch.Tensor:
+    if pred_phys.size(0) == 0:
+        return torch.tensor(0.0, device=pred_phys.device)
+    if pressure_index < 0 or pressure_index >= pred_phys.size(1):
+        return torch.tensor(0.0, device=pred_phys.device)
+
+    x = pos[:, 0]
+    y = pos[:, 1]
+    near_mask = (y.abs() <= near_y) & (x >= -0.05) & (x <= 1.20)
+    if int(near_mask.sum()) == 0:
+        near_mask = torch.ones_like(x, dtype=torch.bool)
+
+    le_mask = near_mask & (x <= le_x)
+    te_mask = near_mask & (x >= te_x)
+
+    p_t = target_phys[:, pressure_index]
+    src, dst = edge_index
+    dpos = pos[dst] - pos[src]
+    dist = dpos.norm(dim=-1).clamp_min(1e-8)
+    grad = (p_t[dst] - p_t[src]).abs() / dist
+    edge_near = near_mask[src] & near_mask[dst]
+    if int(edge_near.sum()) > 0:
+        grad_near = grad[edge_near]
+        q = float(max(0.0, min(1.0, shock_quantile)))
+        thr = torch.quantile(grad_near, q)
+        high_edge = edge_near & (grad >= thr)
+    else:
+        high_edge = torch.zeros_like(grad, dtype=torch.bool)
+
+    node_shock = torch.zeros_like(x, dtype=torch.bool)
+    if int(high_edge.sum()) > 0:
+        node_shock[src[high_edge]] = True
+        node_shock[dst[high_edge]] = True
+    shock_mask = near_mask & node_shock
+
+    weights = torch.ones_like(p_t)
+    if le_gain != 0.0:
+        weights = weights + float(le_gain) * le_mask.float()
+    if te_gain != 0.0:
+        weights = weights + float(te_gain) * te_mask.float()
+    if shock_gain != 0.0:
+        weights = weights + float(shock_gain) * shock_mask.float()
+    weights = weights * near_mask.float()
+    if float(weights.sum()) <= 1e-12:
+        weights = torch.ones_like(weights)
+
+    p_p = pred_phys[:, pressure_index]
+    err2 = (p_p - p_t).pow(2)
+    return (weights * err2).sum() / (weights.sum() + 1e-12)
 
 
 def _evaluate(
@@ -311,6 +436,12 @@ def train_from_args(args: argparse.Namespace) -> None:
 
     in_fields: Optional[List[str]] = args.in_fields.split(",") if args.in_fields else None
     out_fields: Optional[List[str]] = args.out_fields.split(",") if args.out_fields else None
+    train_node_spec = _resolve_path_spec(args.train_node_csv, args.train_node_list_file)
+    val_node_spec = _resolve_path_spec(args.val_node_csv, args.val_node_list_file)
+    test_node_spec = _resolve_path_spec(args.test_node_csv, args.test_node_list_file)
+    train_edge_spec = _resolve_path_spec(args.train_edge_csv, args.train_edge_list_file)
+    val_edge_spec = _resolve_path_spec(args.val_edge_csv, args.val_edge_list_file)
+    test_edge_spec = _resolve_path_spec(args.test_edge_csv, args.test_edge_list_file)
     train_ds = None
     val_ds = None
     test_ds = None
@@ -318,16 +449,16 @@ def train_from_args(args: argparse.Namespace) -> None:
     val_cases: List[str] = []
     test_cases: List[str] = []
 
-    if args.train_node_csv or args.val_node_csv or args.test_node_csv:
-        if args.train_node_csv is None or args.val_node_csv is None:
+    if train_node_spec is not None or val_node_spec is not None or test_node_spec is not None:
+        if train_node_spec is None or val_node_spec is None:
             raise ValueError("train_node_csv and val_node_csv must be provided together.")
-        train_edge = _resolve_edge_paths(args.train_edge_csv, args.edge_csv, "train")
-        val_edge = _resolve_edge_paths(args.val_edge_csv, args.edge_csv, "val")
-        train_ds = _make_dataset(args.train_node_csv, train_edge, in_fields, out_fields)
-        val_ds = _make_dataset(args.val_node_csv, val_edge, in_fields, out_fields)
-        if args.test_node_csv:
-            test_edge = _resolve_edge_paths(args.test_edge_csv, args.edge_csv, "test")
-            test_ds = _make_dataset(args.test_node_csv, test_edge, in_fields, out_fields)
+        train_edge = _resolve_edge_paths(train_edge_spec, args.edge_csv, "train")
+        val_edge = _resolve_edge_paths(val_edge_spec, args.edge_csv, "val")
+        train_ds = _make_dataset(train_node_spec, train_edge, in_fields, out_fields)
+        val_ds = _make_dataset(val_node_spec, val_edge, in_fields, out_fields)
+        if test_node_spec:
+            test_edge = _resolve_edge_paths(test_edge_spec, args.edge_csv, "test")
+            test_ds = _make_dataset(test_node_spec, test_edge, in_fields, out_fields)
         args.in_dim = train_ds.in_dim
         args.out_dim = train_ds.out_dim
         out_fields = train_ds.out_fields
@@ -378,7 +509,23 @@ def train_from_args(args: argparse.Namespace) -> None:
 
     norm_stats = None
     if args.normalize:
-        mean_x, std_x, mean_y, std_y = _compute_stats(train_ds)
+        loaded = False
+        if args.norm_stats_in is not None and Path(args.norm_stats_in).exists():
+            mean_x, std_x, mean_y, std_y = _load_norm_stats(args.norm_stats_in)
+            loaded = True
+            if args.output_dir is not None:
+                _log_line(args.output_dir, f"norm_stats_loaded: {args.norm_stats_in}")
+        else:
+            mean_x, std_x, mean_y, std_y = _compute_stats(train_ds)
+            norm_out = args.norm_stats_out
+            if norm_out is None and args.output_dir is not None:
+                norm_out = str(Path(args.output_dir) / "norm_stats.npz")
+            if norm_out is not None:
+                _save_norm_stats(norm_out, mean_x, std_x, mean_y, std_y)
+                if args.output_dir is not None:
+                    _log_line(args.output_dir, f"norm_stats_saved: {norm_out}")
+        if not loaded and args.norm_stats_in is not None and args.output_dir is not None:
+            _log_line(args.output_dir, f"norm_stats_in_missing_compute_fresh: {args.norm_stats_in}")
         norm_stats = (mean_x.to(device), std_x.to(device), mean_y.to(device), std_y.to(device))
         if args.output_dir is not None:
             _log_line(args.output_dir, f"normalize: true")
@@ -402,6 +549,17 @@ def train_from_args(args: argparse.Namespace) -> None:
         local_beta=args.local_beta,
         local_depth=args.local_depth,
     ).to(device)
+    if args.init_ckpt:
+        init_path = Path(args.init_ckpt)
+        if not init_path.exists():
+            raise FileNotFoundError(f"init-ckpt not found: {init_path}")
+        init_obj = torch.load(str(init_path), map_location="cpu")
+        if not isinstance(init_obj, dict) or "model" not in init_obj:
+            raise ValueError(f"Unexpected init-ckpt format: {init_path}")
+        model.load_state_dict(init_obj["model"], strict=True)
+        msg = f"initialized_from_ckpt: {init_path}"
+        print(msg)
+        _log_line(args.output_dir, msg)
 
     optimizer = Adam(model.parameters(), lr=args.lr)
     total_epochs = args.pretrain_epochs + args.epochs
@@ -413,12 +571,13 @@ def train_from_args(args: argparse.Namespace) -> None:
         train: bool,
         use_flux: bool,
         lambda_flux: float,
+        use_focus: bool,
     ) -> Dict[str, float]:
         if train:
             model.train()
         else:
             model.eval()
-        totals: Dict[str, float] = {"supervised": 0.0, "flux": 0.0, "vorticity": 0.0, "smooth": 0.0, "total": 0.0}
+        totals: Dict[str, float] = {"supervised": 0.0, "flux": 0.0, "vorticity": 0.0, "smooth": 0.0, "focus": 0.0, "total": 0.0}
         count = 0
         for batch in loader:
             batch = to_device(batch, device)
@@ -434,6 +593,9 @@ def train_from_args(args: argparse.Namespace) -> None:
                 if norm_stats is not None:
                     _, _, mean_y, std_y = norm_stats
                     pred_denorm = pred * (std_y + args.norm_eps) + mean_y
+                    target_denorm = batch.y * (std_y + args.norm_eps) + mean_y
+                else:
+                    target_denorm = batch.y
                 loss_dict = compute_losses(
                     pred,
                     batch.y,
@@ -447,6 +609,27 @@ def train_from_args(args: argparse.Namespace) -> None:
                     vel_indices=vel_indices,
                     pred_denorm=pred_denorm,
                 )
+                if use_focus and args.lambda_pressure_focus > 0.0:
+                    pred_phys = pred_denorm if pred_denorm is not None else pred
+                    target_phys = target_denorm
+                    focus = _pressure_focus_loss(
+                        pred_phys=pred_phys,
+                        target_phys=target_phys,
+                        pos=batch.pos,
+                        edge_index=batch.edge_index,
+                        pressure_index=args.focus_pressure_index,
+                        near_y=args.focus_near_y,
+                        le_x=args.focus_le_x,
+                        te_x=args.focus_te_x,
+                        le_gain=args.focus_le_gain,
+                        te_gain=args.focus_te_gain,
+                        shock_gain=args.focus_shock_gain,
+                        shock_quantile=args.focus_shock_quantile,
+                    )
+                else:
+                    focus = torch.tensor(0.0, device=batch.x.device)
+                loss_dict["focus"] = focus
+                loss_dict["total"] = loss_dict["total"] + args.lambda_pressure_focus * focus
                 if train:
                     optimizer.zero_grad()
                     loss_dict["total"].backward()
@@ -462,8 +645,20 @@ def train_from_args(args: argparse.Namespace) -> None:
     # Stage 1: region-adaptive pretraining (skip flux layer)
     for epoch in range(1, args.pretrain_epochs + 1):
         global_epoch = epoch
-        train_losses = run_epoch(train_loader, train=True, use_flux=False, lambda_flux=0.0)
-        val_losses = run_epoch(val_loader, train=False, use_flux=False, lambda_flux=0.0)
+        train_losses = run_epoch(
+            train_loader,
+            train=True,
+            use_flux=False,
+            lambda_flux=0.0,
+            use_focus=bool(args.focus_enable_pretrain),
+        )
+        val_losses = run_epoch(
+            val_loader,
+            train=False,
+            use_flux=False,
+            lambda_flux=0.0,
+            use_focus=bool(args.focus_enable_pretrain),
+        )
         lr = optimizer.param_groups[0]["lr"]
         line = (
             f"[pretrain] Epoch {global_epoch:03d} | train loss {train_losses['total']:.4f} | "
@@ -504,8 +699,20 @@ def train_from_args(args: argparse.Namespace) -> None:
     for epoch in range(1, args.epochs + 1):
         global_epoch = args.pretrain_epochs + epoch
         lambda_flux = args.lambda_flux if use_flux else 0.0
-        train_losses = run_epoch(train_loader, train=True, use_flux=use_flux, lambda_flux=lambda_flux)
-        val_losses = run_epoch(val_loader, train=False, use_flux=use_flux, lambda_flux=lambda_flux)
+        train_losses = run_epoch(
+            train_loader,
+            train=True,
+            use_flux=use_flux,
+            lambda_flux=lambda_flux,
+            use_focus=True,
+        )
+        val_losses = run_epoch(
+            val_loader,
+            train=False,
+            use_flux=use_flux,
+            lambda_flux=lambda_flux,
+            use_focus=True,
+        )
         lr = optimizer.param_groups[0]["lr"]
         line = f"Epoch {global_epoch:03d} | train loss {train_losses['total']:.4f} | val loss {val_losses['total']:.4f}"
         print(line)
